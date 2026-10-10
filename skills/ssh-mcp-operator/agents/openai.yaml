@@ -1,0 +1,7 @@
+interface:
+  display_name: "SSH MCP Operator"
+  short_description: "Operate ssh-mcp profiles and remote commands"
+  default_prompt: "Use $ssh-mcp-operator to configure profiles, select a target, test SSH access, and run commands safely."
+
+policy:
+  allow_implicit_invocation: true

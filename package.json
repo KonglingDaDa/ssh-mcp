@@ -1,0 +1,66 @@
+{
+  "name": "ssh-mcp",
+  "license": "MIT",
+  "version": "2.1.0",
+  "description": "MCP server exposing SSH control for Linux and Windows systems via Model Context Protocol.",
+  "type": "module",
+  "bin": {
+    "ssh-mcp": "build/index.js"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "prepare": "npm run build",
+    "build": "tsc && shx chmod +x build/*.js",
+    "inspect": "npx @modelcontextprotocol/inspector node build/index.js",
+    "test": "cross-env SSH_MCP_DISABLE_MAIN=1 vitest --run",
+    "test:watch": "cross-env SSH_MCP_DISABLE_MAIN=1 vitest",
+    "coverage": "cross-env SSH_MCP_DISABLE_MAIN=1 vitest --run --coverage",
+    "publish:release": "pwsh -File scripts/publish.ps1"
+  },
+  "files": [
+    "build"
+  ],
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.17.5",
+    "ssh2": "^1.17.0",
+    "yaml": "^2.8.2",
+    "zod": "3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^24.5.2",
+    "@types/ssh2": "^1.15.5",
+    "cross-env": "^7.0.3",
+    "shx": "^0.4.0",
+    "testcontainers": "^11.7.0",
+    "ts-node": "^10.9.2",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
+  },
+  "homepage": "https://github.com/KonglingDaDa/ssh-mcp#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/KonglingDaDa/ssh-mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/KonglingDaDa/ssh-mcp/issues"
+  },
+  "keywords": [
+    "ssh",
+    "mcp",
+    "model-context-protocol",
+    "server",
+    "windows",
+    "linux",
+    "automation",
+    "remote",
+    "cli",
+    "typescript"
+  ],
+  "author": "KonglingDaDa",
+  "engines": {
+    "node": ">=18"
+  }
+}
