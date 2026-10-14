@@ -26,6 +26,7 @@ import {
 import { buildSshConfigFromProfile } from './ssh/ssh-config.js';
 import { registerExecTool } from './tools/exec.js';
 import { registerProfileTools } from './tools/profiles.js';
+import { assertTargetProfile } from './tools/result.js';
 import { registerSudoExecTool } from './tools/sudo-exec.js';
 
 const isTestMode = process.env.SSH_MCP_TEST === '1';
@@ -92,11 +93,12 @@ async function openConnection(profile: ProfileDefinition): Promise<SSHConnection
   return connectionManager;
 }
 
-async function getConnectionContext(): Promise<{
+async function getConnectionContext(expectedProfileId?: string): Promise<{
   manager: SSHConnectionManager;
   profile: ProfileDefinition;
 }> {
   const profile = getActiveProfile();
+  assertTargetProfile(profile, expectedProfileId);
   if (connectionManager && connectionManager.getProfileId() !== profile.id) {
     await closeConnectionManager();
   }

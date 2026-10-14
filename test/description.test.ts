@@ -79,7 +79,9 @@ describe('command description functionality', () => {
   it('should execute commands without description (backward compatibility)', async () => {
     const res = await runMcpCommand('echo "test without description"');
     expect(res.error).toBeUndefined();
-    expect(res.result?.content?.[0]?.text).toContain('test without description');
+    const text = res.result?.content?.[0]?.text ?? '';
+    expect(text).toContain('test without description');
+    expect(text).toMatch(/^\[ssh-mcp\] target id=no-pass name="Local No Sudo Password" host=127.0.0.1:2222\n/);
   });
 
   it('should execute commands with simple description', async () => {

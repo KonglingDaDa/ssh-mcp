@@ -8,10 +8,14 @@ import {
 import { sanitizeCommand, shellSingleQuote } from '../ssh/command-utils.js';
 import type { RuntimeOptions } from '../cli/args.js';
 import type { ProfileDefinition } from '../config/types.js';
-import { stampCommandResult } from './result.js';
+import {
+  stampCommandError,
+  stampCommandResult,
+  truncateCommandOutput,
+} from './result.js';
 
 export interface SudoExecToolDependencies {
-  getConnectionContext: () => Promise<{
+  getConnectionContext: (expectedProfileId?: string) => Promise<{
     manager: SSHConnectionManager;
     profile: ProfileDefinition;
   }>;
@@ -36,7 +40,7 @@ export function buildSudoCommand(command: string, sudoPassword?: string): SudoCo
 export function registerSudoExecTool(server: McpServer, deps: SudoExecToolDependencies): void {
   server.tool(
     'sudo-exec',
-    'Runs the command with sudo on the current session active profile. There is no password parameter — uses the profile sudoPassword, or sudo -n if unset. This is only for sudo, not su. If the profile uses suPassword, exec is already elevated; call this only when you specifically need sudo. Do not put passwords in command. Same stamp rule as exec: read line 1 and stop on the wrong target.',
+    'Runs the command with sudo on the current session active profile. Optional profileId is a target guard: if provided and it does not match sessionActiveProfile, the call is rejected. There is no password parameter — uses the profile sudoPassword, or sudo -n if unset. This is only for sudo, not su. If the profile uses suPassword, exec is already elevated; call this only when you specifically need sudo. Do not put passwords in command. Same stamp rule as exec: read line 1 and stop on the wrong target.',
     {
       command: z.string().describe('Remote command body only; do not prefix with sudo and do not include the sudo password'),
       description: z.string().optional().describe('Optional client-side command description; not sent to the remote shell'),
@@ -46,30 +50,49 @@ export function registerSudoExecTool(server: McpServer, deps: SudoExecToolDepend
         .max(60 * 60 * 1000)
         .optional()
         .describe('Optional per-command timeout override in milliseconds'),
+      profileId: z.string().min(1).optional().describe('Optional expected target profile id guard. If provided and does not match sessionActiveProfile, execution is rejected to prevent cross-machine drift.'),
+      maxOutputChars: z.number().int().positive().max(1000000).optional().describe('Optional maximum output characters to return (default 64000)'),
     },
-    async ({ command, timeoutMs }) => {
+    async ({ command, timeoutMs, profileId, maxOutputChars }) => {
       const runtime = deps.getRuntimeOptions();
       const sanitizedCommand = sanitizeCommand(command, runtime.maxChars);
       const effectiveTimeoutMs = timeoutMs ?? runtime.timeoutMs;
+      let profile: ProfileDefinition | undefined;
       try {
-        const { manager, profile } = await deps.getConnectionContext();
-        await manager.ensureConnected();
+        const context = await deps.getConnectionContext(profileId);
+        profile = context.profile;
+        await context.manager.ensureConnected();
 
-        const sudoPlan = buildSudoCommand(sanitizedCommand, manager.getSudoPassword());
+        const sudoPlan = buildSudoCommand(sanitizedCommand, context.manager.getSudoPassword());
         const result = await execSshCommandWithConnection(
-          manager,
+          context.manager,
           sudoPlan.command,
           effectiveTimeoutMs,
           sudoPlan.stdin,
           { useProfileSu: false },
         );
-        return stampCommandResult(result, {
+        const limited = {
+          content: result.content.map((item) => ({
+            ...item,
+            text: truncateCommandOutput(item.text, maxOutputChars),
+          })),
+        };
+        return stampCommandResult(limited, {
           id: profile.id,
           name: profile.name,
           host: profile.host,
           port: profile.port,
         });
       } catch (err: unknown) {
+        if (err instanceof McpError && err.code === ErrorCode.InvalidParams) throw err;
+        if (profile) {
+          throw stampCommandError(err, {
+            id: profile.id,
+            name: profile.name,
+            host: profile.host,
+            port: profile.port,
+          }, maxOutputChars);
+        }
         if (err instanceof McpError) throw err;
         throw new McpError(ErrorCode.InternalError, `Unexpected error: ${(err as Error)?.message ?? err}`);
       }
