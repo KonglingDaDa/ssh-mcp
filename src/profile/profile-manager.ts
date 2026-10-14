@@ -4,7 +4,15 @@ import {
   saveRawProfilesConfig,
   validateRawProfilesConfig,
 } from '../config/loader.js';
-import { type LoadedProfilesConfig, type ProfileDefinition, profileSchema } from '../config/types.js';
+import { type BucketDefinition, type LoadedProfilesConfig, type ProfileDefinition, profileSchema } from '../config/types.js';
+import {
+  buildDirectory,
+  searchCatalog,
+  toSearchCard,
+  type CatalogProfile,
+  type CatalogSearchResult,
+  type SearchCard,
+} from './profile-catalog.js';
 import { chmod, mkdir, readFile, writeFile } from 'fs/promises';
 import path from 'path';
 import { randomUUID } from 'crypto';
@@ -20,7 +28,7 @@ function assertObject(value: unknown, message: string): asserts value is Record<
 }
 
 function cloneRawConfig(rawConfig: Record<string, unknown>): Record<string, unknown> {
-  return JSON.parse(JSON.stringify(rawConfig)) as Record<string, unknown>;
+  return structuredClone(rawConfig);
 }
 
 function sanitizeBackupReason(reason: string): string {
@@ -62,9 +70,26 @@ export interface ProfileCreateInput {
   suPassword?: string;
   sudoPassword?: string;
   note?: string;
+  aliases?: string[];
   tags?: string[];
   contextSummary?: string;
   activate?: boolean;
+}
+
+export interface ProfileLabelUpdate {
+  name?: string;
+  aliases?: string[];
+  note?: string;
+  addTags?: string[];
+  removeTags?: string[];
+}
+
+export interface BucketUpsertInput {
+  id: string;
+  name?: string;
+  aliases?: string[];
+  note?: string;
+  remove?: boolean;
 }
 
 interface PendingDeleteRequest {
@@ -77,7 +102,7 @@ interface PendingDeleteRequest {
 
 function defaultNoteForProfile(input: ProfileCreateInput): string {
   if (input.note && input.note.trim().length > 0) {
-    return toShortNote(input.note);
+    return input.note.trim();
   }
 
   const hints: string[] = [];
@@ -105,6 +130,9 @@ export class ProfileManager {
 
   async initialize(): Promise<void> {
     const loaded = await loadProfilesConfig(this.configPath);
+    if (this.profileOverride && !hasProfile(loaded.config.profiles, this.profileOverride)) {
+      throw new Error(`Startup profile override "${this.profileOverride}" not found in profiles`);
+    }
     this.loadedConfig = loaded;
     this.activeProfileId = this.pickActiveProfileId(loaded, this.profileOverride);
   }
@@ -169,6 +197,11 @@ export class ProfileManager {
     return this.activeProfileId as string;
   }
 
+  getPersistedActiveProfileId(): string {
+    const loaded = this.ensureLoaded();
+    return readPersistedActiveProfileId(loaded.rawConfig, loaded.config.activeProfile);
+  }
+
   getActiveProfile(): ProfileDefinition {
     const loaded = this.ensureLoaded();
     const activeId = this.activeProfileId as string;
@@ -188,10 +221,58 @@ export class ProfileManager {
     return loaded.config.defaults ?? {};
   }
 
+  getStartupProfileOverride(): string | undefined {
+    return this.profileOverride;
+  }
+
+  getTargetView(): Record<string, unknown> {
+    return {
+      activeProfile: this.getActiveProfileId(),
+      sessionActiveProfile: this.getActiveProfileId(),
+      fileActiveProfile: this.getPersistedActiveProfileId(),
+      startupProfileOverride: this.profileOverride ?? null,
+    };
+  }
+
   listProfiles(): Record<string, unknown>[] {
     const loaded = this.ensureLoaded();
     const activeId = this.activeProfileId as string;
     return loaded.config.profiles.map((profile) => profileSummary(profile, activeId));
+  }
+
+  private catalogBuckets(): BucketDefinition[] {
+    return this.ensureLoaded().config.buckets ?? [];
+  }
+
+  private catalogProfiles(): CatalogProfile[] {
+    const loaded = this.ensureLoaded();
+    const activeId = this.getActiveProfileId();
+    return loaded.config.profiles.map((profile) => ({
+      id: profile.id,
+      name: profile.name,
+      aliases: profile.aliases ?? [],
+      host: profile.host,
+      port: profile.port,
+      user: profile.user,
+      note: profile.note ?? '',
+      tags: profile.tags ?? [],
+      authType: profile.auth.type,
+      elevatedViaSu: Boolean(profile.suPassword),
+      active: profile.id === activeId,
+    }));
+  }
+
+  directoryView(): Record<string, unknown> {
+    const profiles = this.catalogProfiles();
+    const buckets = this.catalogBuckets();
+    const active = profiles.find((profile) => profile.active) ?? null;
+    return {
+      ...this.getTargetView(),
+      profileCount: profiles.length,
+      activeProfileSummary: active ? toSearchCard(active, buckets) : null,
+      ...buildDirectory(profiles, buckets),
+      hint: 'Bucket directory only. Call profiles-find with bucket or query to see machines.',
+    };
   }
 
   useProfile(profileId: string): Record<string, unknown> {
@@ -217,48 +298,16 @@ export class ProfileManager {
     return profileSummary(profile, this.getActiveProfileId());
   }
 
-  findProfiles(query: string): Array<Record<string, unknown>> {
-    const normalized = query.trim().toLowerCase();
-    const all = this.listProfiles();
-    if (!normalized) {
-      return all;
-    }
+  findProfiles(query: string): SearchCard[] {
+    return this.searchProfiles({ query }).matches;
+  }
 
-    const scored = all
-      .map((profile) => {
-        const record = profile as Record<string, unknown>;
-        const fields = {
-          id: String(record.id ?? '').toLowerCase(),
-          name: String(record.name ?? '').toLowerCase(),
-          host: String(record.host ?? '').toLowerCase(),
-          user: String(record.user ?? '').toLowerCase(),
-          note: String(record.note ?? '').toLowerCase(),
-          tags: Array.isArray(record.tags) ? (record.tags as string[]).map((item) => item.toLowerCase()) : [],
-        };
-
-        let score = 0;
-        if (fields.id === normalized) score += 100;
-        if (fields.id.includes(normalized)) score += 50;
-        if (fields.host === normalized) score += 40;
-        if (fields.host.includes(normalized)) score += 20;
-        if (fields.name.includes(normalized)) score += 15;
-        if (fields.user.includes(normalized)) score += 10;
-        if (fields.note.includes(normalized)) score += 8;
-        if (fields.tags.some((tag) => tag.includes(normalized))) score += 12;
-
-        return {
-          score,
-          profile: record,
-        };
-      })
-      .filter((item) => item.score > 0)
-      .sort((a, b) => b.score - a.score)
-      .map((item) => ({
-        ...item.profile,
-        matchScore: item.score,
-      }));
-
-    return scored;
+  searchProfiles(input: { query?: string; bucket?: string }): CatalogSearchResult & Record<string, unknown> {
+    const result = searchCatalog(this.catalogProfiles(), this.catalogBuckets(), input);
+    return {
+      ...this.getTargetView(),
+      ...result,
+    };
   }
 
   async reload(): Promise<Record<string, unknown>> {
@@ -268,9 +317,7 @@ export class ProfileManager {
 
     return {
       configPath: this.configPath,
-      activeProfile: this.activeProfileId,
-      profileCount: loaded.config.profiles.length,
-      profiles: this.listProfiles(),
+      ...this.directoryView(),
     };
   }
 
@@ -297,6 +344,7 @@ export class ProfileManager {
     const parsed = profileSchema.parse({
       id: input.id,
       name: input.name,
+      aliases: input.aliases ?? [],
       host: input.host,
       port: input.port ?? 22,
       user: input.user,
@@ -321,18 +369,98 @@ export class ProfileManager {
       note: parsed.note,
       tags: input.tags ?? [],
     };
+    if (parsed.aliases.length > 0) rawProfile.aliases = parsed.aliases;
 
     if (input.suPassword) rawProfile.suPassword = input.suPassword;
     if (input.sudoPassword) rawProfile.sudoPassword = input.sudoPassword;
     rawProfiles.push(rawProfile);
 
-    const shouldActivate = input.activate ?? true;
+    const shouldActivate = input.activate === true;
+    await this.persistRawConfig(nextRawConfig, this.activeProfileId ?? undefined);
     if (shouldActivate) {
-      nextRawConfig.activeProfile = input.id;
+      this.activeProfileId = input.id;
+    }
+    return profileSummary(this.getProfile(input.id), this.getActiveProfileId());
+  }
+
+  async upsertBucket(input: BucketUpsertInput): Promise<Record<string, unknown>> {
+    const loaded = this.ensureLoaded();
+    const nextRawConfig = cloneRawConfig(loaded.rawConfig);
+    const buckets = Array.isArray(nextRawConfig.buckets)
+      ? nextRawConfig.buckets as Record<string, unknown>[]
+      : [];
+    const index = buckets.findIndex((item) => item.id === input.id);
+
+    if (input.remove) {
+      if (index < 0) {
+        throw new Error(`Bucket "${input.id}" not found`);
+      }
+      buckets.splice(index, 1);
+      nextRawConfig.buckets = buckets;
+      await this.persistRawConfig(nextRawConfig);
+      return this.directoryView();
     }
 
-    await this.persistRawConfig(nextRawConfig, shouldActivate ? input.id : this.activeProfileId ?? undefined);
-    return profileSummary(this.getProfile(input.id), this.getActiveProfileId());
+    if (!input.name || input.name.trim().length === 0) {
+      throw new Error('bucket name is required');
+    }
+
+    const nextBucket: Record<string, unknown> = {
+      ...(index >= 0 ? buckets[index] : {}),
+      id: input.id,
+      name: input.name,
+    };
+    if (input.aliases !== undefined) nextBucket.aliases = input.aliases;
+    if (input.note !== undefined) nextBucket.note = input.note;
+    if (index >= 0) buckets[index] = nextBucket;
+    else buckets.push(nextBucket);
+    nextRawConfig.buckets = buckets;
+    await this.persistRawConfig(nextRawConfig);
+    return this.directoryView();
+  }
+
+  async updateProfileLabels(profileId: string, input: ProfileLabelUpdate): Promise<Record<string, unknown>> {
+    const hasChange = input.name !== undefined
+      || input.aliases !== undefined
+      || input.note !== undefined
+      || (input.addTags?.length ?? 0) > 0
+      || (input.removeTags?.length ?? 0) > 0;
+    if (!hasChange) {
+      throw new Error('No label fields to update');
+    }
+
+    this.getProfile(profileId);
+    const loaded = this.ensureLoaded();
+    const nextRawConfig = cloneRawConfig(loaded.rawConfig);
+    const rawProfile = this.findRawProfile(nextRawConfig, profileId);
+    if (!rawProfile) {
+      throw new Error(`Raw config profile "${profileId}" not found`);
+    }
+
+    if (input.name !== undefined) rawProfile.name = input.name;
+    if (input.aliases !== undefined) rawProfile.aliases = input.aliases;
+    if (input.note !== undefined) rawProfile.note = input.note;
+
+    if ((input.addTags?.length ?? 0) > 0 || (input.removeTags?.length ?? 0) > 0) {
+      const current = Array.isArray(rawProfile.tags)
+        ? rawProfile.tags.filter((item): item is string => typeof item === 'string')
+        : [];
+      const remove = new Set((input.removeTags ?? []).map((tag) => tag.trim().toLowerCase()));
+      const nextTags = current.filter((tag) => !remove.has(tag.trim().toLowerCase()));
+      for (const tag of input.addTags ?? []) {
+        const trimmed = tag.trim();
+        if (!trimmed) {
+          throw new Error('tag must not be empty');
+        }
+        if (!nextTags.some((item) => item.trim().toLowerCase() === trimmed.toLowerCase())) {
+          nextTags.push(trimmed);
+        }
+      }
+      rawProfile.tags = nextTags;
+    }
+
+    await this.persistRawConfig(nextRawConfig);
+    return profileSummary(this.getProfile(profileId), this.getActiveProfileId());
   }
 
   async prepareDeleteProfile(profileId: string): Promise<Record<string, unknown>> {
@@ -393,19 +521,22 @@ export class ProfileManager {
     }
 
     const runtimeActiveId = this.getActiveProfileId();
-    const persistedActiveId = readPersistedActiveProfileId(loaded.rawConfig, loaded.config.activeProfile);
-    const nextPersistedActiveId = persistedActiveId === profileId
+    // Compare the expanded file default, not raw (${ENV} never equals a profile id).
+    const fileDefaultActiveId = loaded.config.activeProfile;
+    const deletingFileDefault = fileDefaultActiveId === profileId;
+    const nextPersistedActiveId = deletingFileDefault
       ? nextProfiles[0].id
-      : persistedActiveId;
-    const normalizedPersistedActiveId = hasProfile(nextProfiles, nextPersistedActiveId)
-      ? nextPersistedActiveId
-      : nextProfiles[0].id;
+      : readPersistedActiveProfileId(loaded.rawConfig, fileDefaultActiveId);
+    const survivingStartupPin = this.profileOverride
+      && hasProfile(nextProfiles, this.profileOverride)
+      ? this.profileOverride
+      : undefined;
     const nextRuntimeActiveId = runtimeActiveId === profileId
-      ? normalizedPersistedActiveId
+      ? (survivingStartupPin ?? (deletingFileDefault ? nextProfiles[0].id : fileDefaultActiveId))
       : runtimeActiveId;
     const normalizedRuntimeActiveId = hasProfile(nextProfiles, nextRuntimeActiveId)
       ? nextRuntimeActiveId
-      : normalizedPersistedActiveId;
+      : nextProfiles[0].id;
 
     const nextRawConfig = cloneRawConfig(loaded.rawConfig);
     const rawProfiles = this.getRawProfiles(nextRawConfig);
@@ -415,7 +546,7 @@ export class ProfileManager {
     }
 
     nextRawConfig.profiles = filteredRawProfiles;
-    nextRawConfig.activeProfile = normalizedPersistedActiveId;
+    nextRawConfig.activeProfile = nextPersistedActiveId;
     await this.persistRawConfig(nextRawConfig, normalizedRuntimeActiveId);
 
     this.pendingDeletes.delete(deleteRequestId);
@@ -423,7 +554,7 @@ export class ProfileManager {
       deletedProfileId: profileId,
       deletedProfile: profileSummary(profileToDelete, normalizedRuntimeActiveId),
       activeProfile: normalizedRuntimeActiveId,
-      persistedActiveProfile: normalizedPersistedActiveId,
+      persistedActiveProfile: nextPersistedActiveId,
       backupPath: pending.backupPath,
     };
   }

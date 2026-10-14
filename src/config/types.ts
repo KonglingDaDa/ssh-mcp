@@ -62,16 +62,44 @@ export const profileIdSchema = z.string()
     'profile id must use only letters, numbers, dot, underscore, or hyphen, and must start with a letter or number',
   );
 
+const singleLineText = (label: string) => z.string()
+  .min(1, `${label} is required`)
+  .refine((value) => !/[\r\n]/.test(value), {
+    message: `${label} must be a single line`,
+  });
+
+const aliasSchema = z.string()
+  .min(1, 'alias must not be empty')
+  .max(80, 'alias must be 80 characters or fewer')
+  .refine((value) => value.trim().length > 0 && !/[\r\n]/.test(value), {
+    message: 'alias must be a non-empty single line',
+  });
+
+const bucketNameSchema = z.string()
+  .min(1, 'bucket name is required')
+  .max(80, 'bucket name must be 80 characters or fewer')
+  .refine((value) => !/[\r\n]/.test(value), {
+    message: 'bucket name must be a single line',
+  });
+
+export const bucketSchema = z.object({
+  id: profileIdSchema,
+  name: bucketNameSchema,
+  aliases: z.array(aliasSchema).max(8).default([]),
+  note: z.string().max(200).default(''),
+}).strict();
+
 export const profileSchema = z.object({
   id: profileIdSchema,
-  name: z.string().min(1, 'profile name is required'),
-  host: z.string().min(1, 'profile host is required'),
+  name: singleLineText('profile name'),
+  aliases: z.array(aliasSchema).max(8).default([]),
+  host: singleLineText('profile host'),
   port: portSchema.default(22),
   user: z.string().min(1, 'profile user is required'),
   auth: profileAuthSchema,
   suPassword: z.string().min(1).optional(),
   sudoPassword: z.string().min(1).optional(),
-  note: z.string().default(''),
+  note: z.string().max(500).default(''),
   tags: z.array(z.string()).default([]),
 }).strict();
 
@@ -79,6 +107,7 @@ export const profilesConfigSchema = z.object({
   version: z.literal(1),
   activeProfile: profileIdSchema,
   defaults: profileDefaultsSchema.optional().default({}),
+  buckets: z.array(bucketSchema).default([]),
   profiles: z.array(profileSchema).min(1, 'at least one profile is required'),
 }).strict().superRefine((value, ctx) => {
   const seenIds = new Set<string>();
@@ -92,10 +121,37 @@ export const profilesConfigSchema = z.object({
     }
     seenIds.add(profile.id);
   }
+
+  const seenBucketIds = new Set<string>();
+  const seenBucketTokens = new Map<string, string>();
+  for (const bucket of value.buckets) {
+    if (seenBucketIds.has(bucket.id)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `duplicate bucket id: ${bucket.id}`,
+        path: ['buckets'],
+      });
+    }
+    seenBucketIds.add(bucket.id);
+    for (const token of [bucket.id, bucket.name, ...bucket.aliases]) {
+      const key = token.trim().toLowerCase();
+      if (!key) continue;
+      const owner = seenBucketTokens.get(key);
+      if (owner && owner !== bucket.id) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `bucket token "${token}" is used by both "${owner}" and "${bucket.id}"`,
+          path: ['buckets'],
+        });
+      }
+      seenBucketTokens.set(key, bucket.id);
+    }
+  }
 });
 
 export type ProfileAuth = z.infer<typeof profileAuthSchema>;
 export type ProfileDefaults = z.infer<typeof profileDefaultsSchema>;
+export type BucketDefinition = z.infer<typeof bucketSchema>;
 export type ProfileDefinition = z.infer<typeof profileSchema>;
 export type ProfilesConfig = z.infer<typeof profilesConfigSchema>;
 

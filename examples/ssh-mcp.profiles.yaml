@@ -6,9 +6,18 @@ defaults:
   maxChars: none
   disableSudo: false
 
+buckets:
+  - id: template
+    name: 模板机
+    aliases: [template, 模板]
+  - id: relay
+    name: 中转
+    aliases: [relay, 中转]
+
 profiles:
   - id: fi-template
     name: 芬兰模板机
+    aliases: [Finland template]
     host: "fi-template.example.com"
     port: 9900
     user: root
@@ -21,6 +30,7 @@ profiles:
 
   - id: jp-relay
     name: 日本中转
+    aliases: [Japan relay]
     host: "jp-relay.example.com"
     port: 22
     user: root

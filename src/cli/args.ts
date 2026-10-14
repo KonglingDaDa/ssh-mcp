@@ -47,6 +47,19 @@ function normalizeOptionalString(value: string | null | undefined): string | und
   return trimmed.length > 0 ? trimmed : undefined;
 }
 
+function parseBooleanFlag(
+  value: string | null | undefined,
+  fallback: boolean,
+  name: string,
+): boolean {
+  if (value === undefined) return fallback;
+  if (value === null || value.trim() === '') return true;
+  const lowered = value.trim().toLowerCase();
+  if (['true', '1', 'yes', 'on'].includes(lowered)) return true;
+  if (['false', '0', 'no', 'off'].includes(lowered)) return false;
+  throw new Error(`Invalid --${name} value: ${value}`);
+}
+
 function parsePositiveInt(input: string | null | undefined, fallback: number): number {
   if (typeof input !== 'string' || input.trim() === '') return fallback;
   const parsed = Number.parseInt(input, 10);
@@ -80,9 +93,11 @@ export function resolveRuntimeOptions(config: ArgvConfig, defaults?: ProfileDefa
   const maxCharsSource = config.maxChars ?? defaults?.maxChars;
   const maxChars = parseMaxChars(maxCharsSource, DEFAULT_MAX_CHARS);
 
-  const disableSudo = config.disableSudo !== undefined
-    ? true
-    : Boolean(defaults?.disableSudo ?? false);
+  const disableSudo = parseBooleanFlag(
+    config.disableSudo,
+    Boolean(defaults?.disableSudo ?? false),
+    'disableSudo',
+  );
 
   return {
     timeoutMs,

@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { mkdtemp, rm, writeFile } from 'fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'fs/promises';
 import os from 'os';
 import path from 'path';
-import { spawn, type ChildProcessWithoutNullStreams } from 'child_process';
+import { spawn } from 'child_process';
 
 const tempDirs: string[] = [];
 
@@ -128,10 +128,17 @@ profiles:
       expect(beforeText).toContain('127.0.0.1:1');
 
       const switchRes = await server.callTool('profiles-use', { profileId: 'profile-b' });
-      expect(extractResponseText(switchRes)).toContain('profile-b');
+      const switchText = extractResponseText(switchRes);
+      expect(switchText).toContain('profile-b');
+      expect(switchText).toContain('"persisted": false');
+      expect(switchText).toContain('"fileActiveProfile": "profile-a"');
+
+      const onDisk = await readFile(configPath, 'utf8');
+      expect(onDisk).toContain('activeProfile: profile-a');
 
       const after = await server.callTool('exec', { command: 'hostname' });
       const afterText = extractResponseText(after).toLowerCase();
+      expect(afterText).toContain('profile-b');
       expect(afterText).toContain('127.0.0.1:2');
     } finally {
       server.close();

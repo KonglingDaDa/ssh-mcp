@@ -1,4 +1,4 @@
-import { access, readFile, writeFile } from 'fs/promises';
+import { access, readFile, rename, stat, writeFile } from 'fs/promises';
 import path from 'path';
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
 import {
@@ -24,7 +24,7 @@ function assertObject(value: unknown): asserts value is Record<string, unknown> 
 }
 
 function deepClone<T>(value: T): T {
-  return JSON.parse(JSON.stringify(value)) as T;
+  return structuredClone(value);
 }
 
 function expandEnvString(input: string): string {
@@ -37,21 +37,42 @@ function expandEnvString(input: string): string {
   });
 }
 
-function expandEnv(value: unknown): unknown {
+function expandIfString(target: Record<string, unknown>, key: string): void {
+  const value = target[key];
   if (typeof value === 'string') {
-    return expandEnvString(value);
+    target[key] = expandEnvString(value);
   }
-  if (Array.isArray(value)) {
-    return value.map((item) => expandEnv(item));
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+/** Expand env only in secret fields and activeProfile. Do not walk the whole tree. */
+function expandSecretsInConfig(raw: Record<string, unknown>): Record<string, unknown> {
+  const cloned = deepClone(raw);
+
+  expandIfString(cloned, 'activeProfile');
+
+  if (!Array.isArray(cloned.profiles)) {
+    return cloned;
   }
-  if (value && typeof value === 'object') {
-    const expanded: Record<string, unknown> = {};
-    for (const [key, item] of Object.entries(value)) {
-      expanded[key] = expandEnv(item);
+
+  for (const profile of cloned.profiles) {
+    if (!isPlainObject(profile)) {
+      continue;
     }
-    return expanded;
+
+    expandIfString(profile, 'suPassword');
+    expandIfString(profile, 'sudoPassword');
+
+    if (isPlainObject(profile.auth)) {
+      expandIfString(profile.auth, 'password');
+      expandIfString(profile.auth, 'keyPath');
+    }
   }
-  return value;
+
+  return cloned;
 }
 
 function ensureActiveProfileExists(config: ProfilesConfig): void {
@@ -69,7 +90,16 @@ export function resolveKeyPath(keyPath: string, configFilePath: string): string 
   return path.resolve(baseDir, keyPath);
 }
 
-async function validateProfileAuthFields(config: ProfilesConfig, filePath: string): Promise<void> {
+export interface ValidateProfileAuthOptions {
+  checkKeyPathExists?: boolean;
+}
+
+async function validateProfileAuthFields(
+  config: ProfilesConfig,
+  filePath: string,
+  options: ValidateProfileAuthOptions = {},
+): Promise<void> {
+  const checkKeyPathExists = options.checkKeyPathExists !== false;
   for (const profile of config.profiles) {
     if (profile.auth.type === 'password') {
       if (!profile.auth.password || profile.auth.password.trim() === '') {
@@ -79,6 +109,9 @@ async function validateProfileAuthFields(config: ProfilesConfig, filePath: strin
     if (profile.auth.type === 'key') {
       if (!profile.auth.keyPath || profile.auth.keyPath.trim() === '') {
         throw new Error(`Profile "${profile.id}" requires auth.keyPath`);
+      }
+      if (!checkKeyPathExists) {
+        continue;
       }
       const resolvedPath = resolveKeyPath(profile.auth.keyPath, filePath);
       try {
@@ -93,11 +126,12 @@ async function validateProfileAuthFields(config: ProfilesConfig, filePath: strin
 export async function validateRawProfilesConfig(
   rawConfig: Record<string, unknown>,
   filePath: string,
+  options: ValidateProfileAuthOptions = {},
 ): Promise<ProfilesConfig> {
-  const expandedConfig = expandEnv(deepClone(rawConfig));
+  const expandedConfig = expandSecretsInConfig(rawConfig);
   const parsedConfig = profilesConfigSchema.parse(expandedConfig);
   ensureActiveProfileExists(parsedConfig);
-  await validateProfileAuthFields(parsedConfig, filePath);
+  await validateProfileAuthFields(parsedConfig, filePath, options);
   return parsedConfig;
 }
 
@@ -116,7 +150,9 @@ export async function loadProfilesConfig(filePath: string): Promise<LoadedProfil
   const format = inferFormat(filePath);
   const content = await readFile(filePath, 'utf8');
   const rawConfig = parseRawContent(content, format);
-  const parsedConfig = await validateRawProfilesConfig(rawConfig, filePath);
+  const parsedConfig = await validateRawProfilesConfig(rawConfig, filePath, {
+    checkKeyPathExists: false,
+  });
 
   return {
     filePath,
@@ -135,7 +171,16 @@ function serializeRawConfig(rawConfig: Record<string, unknown>, format: 'yaml' |
 
 export async function saveRawProfilesConfig(loaded: LoadedProfilesConfig): Promise<void> {
   const output = serializeRawConfig(loaded.rawConfig, loaded.format);
-  await writeFile(loaded.filePath, output, 'utf8');
+  const tmpPath = `${loaded.filePath}.${process.pid}.tmp`;
+  let mode = 0o600;
+  try {
+    const existing = await stat(loaded.filePath);
+    mode = existing.mode & 0o777;
+  } catch {
+    // New file: default to owner-only.
+  }
+  await writeFile(tmpPath, output, { encoding: 'utf8', mode });
+  await rename(tmpPath, loaded.filePath);
 }
 
 export function profileSummary(profile: ProfileDefinition, activeProfileId: string): Record<string, unknown> {
@@ -149,6 +194,7 @@ export function profileSummary(profile: ProfileDefinition, activeProfileId: stri
   return {
     id: profile.id,
     name: profile.name,
+    aliases: profile.aliases ?? [],
     host: profile.host,
     port: profile.port,
     user: profile.user,
@@ -156,5 +202,6 @@ export function profileSummary(profile: ProfileDefinition, activeProfileId: stri
     tags: profile.tags ?? [],
     auth: authSummary,
     active: profile.id === activeProfileId,
+    elevatedViaSu: Boolean(profile.suPassword),
   };
 }
