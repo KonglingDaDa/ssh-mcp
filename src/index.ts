@@ -11,6 +11,7 @@ import {
   type RuntimeOptions,
   type StartupMode,
 } from './cli/args.js';
+import type { ProfileDefinition } from './config/types.js';
 import { ProfileManager } from './profile/profile-manager.js';
 import {
   DEFAULT_MAX_CHARS,
@@ -19,7 +20,6 @@ import {
 } from './ssh/command-utils.js';
 import {
   SSHConnectionManager,
-  type SSHConfig,
   execSshCommand,
   execSshCommandWithConnection,
 } from './ssh/connection-manager.js';
@@ -45,11 +45,19 @@ const server = new McpServer({
 let startupMode: StartupMode | null = null;
 let profileManager: ProfileManager | null = null;
 let connectionManager: SSHConnectionManager | null = null;
+let connectionOpening: Promise<SSHConnectionManager> | null = null;
 let initialRuntimeOptions: RuntimeOptions = {
   timeoutMs: DEFAULT_TIMEOUT_MS,
   maxChars: DEFAULT_MAX_CHARS,
   disableSudo: false,
 };
+
+function getActiveProfile(): ProfileDefinition {
+  if (!profileManager) {
+    throw new McpError(ErrorCode.InternalError, 'Profile mode not initialized');
+  }
+  return profileManager.getActiveProfile();
+}
 
 function getRuntimeOptions(): RuntimeOptions {
   if (profileManager) {
@@ -63,31 +71,49 @@ function getRuntimeOptions(): RuntimeOptions {
 }
 
 async function closeConnectionManager(): Promise<void> {
+  connectionOpening = null;
   if (!connectionManager) return;
   connectionManager.close();
   connectionManager = null;
 }
 
-async function buildSshConfig(mode: StartupMode): Promise<SSHConfig> {
+async function openConnection(profile: ProfileDefinition): Promise<SSHConnectionManager> {
   if (!profileManager) {
     throw new McpError(ErrorCode.InternalError, 'Profile mode not initialized');
   }
-
-  const profile = profileManager.getActiveProfile();
-  return buildSshConfigFromProfile(profile, profileManager.getConfigPath());
+  const sshConfig = await buildSshConfigFromProfile(profile, profileManager.getConfigPath());
+  if (getActiveProfile().id !== profile.id) {
+    throw new McpError(ErrorCode.InternalError, 'Profile changed while opening SSH connection');
+  }
+  if (!connectionManager || connectionManager.getProfileId() !== profile.id) {
+    connectionManager?.close();
+    connectionManager = new SSHConnectionManager(sshConfig);
+  }
+  return connectionManager;
 }
 
-async function getConnectionManager(): Promise<SSHConnectionManager> {
-  if (!startupMode) {
-    throw new McpError(ErrorCode.InternalError, 'Server startup mode is not initialized');
-  }
-  if (connectionManager) {
-    return connectionManager;
+async function getConnectionContext(): Promise<{
+  manager: SSHConnectionManager;
+  profile: ProfileDefinition;
+}> {
+  const profile = getActiveProfile();
+  if (connectionManager && connectionManager.getProfileId() !== profile.id) {
+    await closeConnectionManager();
   }
 
-  const sshConfig = await buildSshConfig(startupMode);
-  connectionManager = new SSHConnectionManager(sshConfig);
-  return connectionManager;
+  if (!connectionManager) {
+    if (!connectionOpening) {
+      connectionOpening = openConnection(profile).finally(() => {
+        connectionOpening = null;
+      });
+    }
+    await connectionOpening;
+  }
+
+  if (!connectionManager || connectionManager.getProfileId() !== getActiveProfile().id) {
+    throw new McpError(ErrorCode.InternalError, 'SSH connection was not initialized for the active profile');
+  }
+  return { manager: connectionManager, profile: getActiveProfile() };
 }
 
 async function initializeRuntime(): Promise<void> {
@@ -99,13 +125,13 @@ async function initializeRuntime(): Promise<void> {
 
 function registerTools(): void {
   registerExecTool(server, {
-    getConnectionManager,
+    getConnectionContext,
     getRuntimeOptions,
   });
 
   if (!getRuntimeOptions().disableSudo) {
     registerSudoExecTool(server, {
-      getConnectionManager,
+      getConnectionContext,
       getRuntimeOptions,
     });
   }

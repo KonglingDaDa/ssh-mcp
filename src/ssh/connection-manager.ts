@@ -12,6 +12,9 @@ export interface SSHConfig {
   privateKey?: string;
   suPassword?: string;
   sudoPassword?: string;
+  keepaliveInterval?: number;
+  keepaliveCountMax?: number;
+  readyTimeout?: number;
 }
 
 export interface SshTestStepResult {
@@ -99,6 +102,17 @@ function formatCommandError(target: string, result: CommandResult): string {
   return `Error (${status}) (${target})${output ? `:\n${output}` : ''}`;
 }
 
+function watchClientLoss(conn: Client, onLost: (err: Error) => void): () => void {
+  const onError = (err: Error) => onLost(err);
+  const onClose = () => onLost(new Error('connection closed'));
+  conn.on('error', onError);
+  conn.on('close', onClose);
+  return () => {
+    conn.removeListener('error', onError);
+    conn.removeListener('close', onClose);
+  };
+}
+
 function abortCommandStream(stream: ClientChannel | null, conn: Client): void {
   if (stream) {
     try {
@@ -117,6 +131,18 @@ function abortCommandStream(stream: ClientChannel | null, conn: Client): void {
   } catch {
     // no-op
   }
+}
+
+export function abandonLateChannel(
+  isResolved: boolean,
+  stream?: { close: () => void; signal?: (name: string) => void } | null,
+): boolean {
+  if (!isResolved) return false;
+  if (stream) {
+    try { stream.signal?.('TERM'); } catch { /* late channel after timeout */ }
+    try { stream.close(); } catch { /* late channel after timeout */ }
+  }
+  return true;
 }
 
 function mergeStdin(stdinPrefix?: string, stdin?: string): string | undefined {
@@ -177,8 +203,13 @@ export class SSHConnectionManager {
   }
 
   private getConnectConfig(): Omit<SSHConfig, 'profileId'> {
-    const { profileId, ...config } = this.sshConfig;
-    return config;
+    const { profileId: _profileId, ...config } = this.sshConfig;
+    return {
+      keepaliveInterval: 15000,
+      keepaliveCountMax: 3,
+      readyTimeout: 10000,
+      ...config,
+    };
   }
 
   private async connectOnce(): Promise<void> {
@@ -234,6 +265,10 @@ export class SSHConnectionManager {
     return this.conn !== null && Boolean((this.conn as any)._sock) && !(this.conn as any)._sock.destroyed;
   }
 
+  getProfileId(): string | undefined {
+    return this.sshConfig.profileId;
+  }
+
   getSudoPassword(): string | undefined {
     return this.sshConfig.sudoPassword;
   }
@@ -286,7 +321,15 @@ export class SSHConnectionManager {
     };
   }
 
-  close(): void {
+  close(expectedConn?: Client): void {
+    if (expectedConn && this.conn !== expectedConn) {
+      try {
+        expectedConn.end();
+      } catch {
+        /* detached timed-out client; keep manager connection */
+      }
+      return;
+    }
     if (!this.conn) return;
     this.conn.end();
     this.conn = null;
@@ -311,25 +354,44 @@ export async function execSshCommandWithConnection(
     const executableCommand = manager.prepareExecutableCommand(command, options);
     const stdinText = mergeStdin(executableCommand.stdinPrefix, stdin);
 
+    let detachWatch = () => {};
+    const finish = (settle: () => void) => {
+      if (isResolved) return;
+      isResolved = true;
+      clearTimeout(timeoutId);
+      detachWatch();
+      settle();
+    };
+    detachWatch = watchClientLoss(conn, (err) => {
+      finish(() => {
+        reject(new McpError(
+          ErrorCode.InternalError,
+          `SSH connection lost (${target}): ${err.message}`,
+        ));
+      });
+    });
+
     timeoutId = setTimeout(() => {
-      if (!isResolved) {
-        isResolved = true;
+      finish(() => {
         abortCommandStream(streamRef, conn);
-        manager.close();
+        manager.close(conn);
         reject(new McpError(
           ErrorCode.InternalError,
           `Command execution timed out after ${timeoutMs}ms (${target})`,
         ));
-      }
+      });
     }, timeoutMs);
 
     conn.exec(executableCommand.command, (err: Error | undefined, stream: ClientChannel) => {
+      if (abandonLateChannel(isResolved, stream)) {
+        return;
+      }
+
       if (err) {
-        if (!isResolved) {
-          isResolved = true;
-          clearTimeout(timeoutId);
+        finish(() => {
+          manager.close(conn);
           reject(new McpError(ErrorCode.InternalError, `SSH exec error (${target}): ${err.message}`));
-        }
+        });
         return;
       }
 
@@ -350,6 +412,16 @@ export async function execSshCommandWithConnection(
         // no-op
       }
 
+      stream.on('error', (streamErr: Error) => {
+        finish(() => {
+          manager.close(conn);
+          reject(new McpError(
+            ErrorCode.InternalError,
+            `SSH channel error (${target}): ${streamErr.message}`,
+          ));
+        });
+      });
+
       stream.on('data', (data: Buffer) => {
         stdout += data.toString();
       });
@@ -359,19 +431,18 @@ export async function execSshCommandWithConnection(
       });
 
       stream.on('close', (code: number | null, signal?: string) => {
-        if (isResolved) return;
-        isResolved = true;
-        clearTimeout(timeoutId);
-        const result = { stdout, stderr, code, signal };
-        if (code !== 0 || signal) {
-          reject(new McpError(ErrorCode.InternalError, formatCommandError(target, result)));
-          return;
-        }
-        resolve({
-          content: [{
-            type: 'text',
-            text: formatCommandOutput(result),
-          }],
+        finish(() => {
+          const result = { stdout, stderr, code, signal };
+          if (code !== 0 || signal) {
+            reject(new McpError(ErrorCode.InternalError, formatCommandError(target, result)));
+            return;
+          }
+          resolve({
+            content: [{
+              type: 'text',
+              text: formatCommandOutput(result),
+            }],
+          });
         });
       });
     });
@@ -406,13 +477,24 @@ export async function execSshCommand(
     }, timeoutMs);
 
     conn.on('ready', () => {
+      if (isResolved) {
+        try {
+          conn.end();
+        } catch {
+          // already timed out
+        }
+        return;
+      }
+
       conn.exec(executableCommand.command, (err: Error | undefined, stream: ClientChannel) => {
+        if (abandonLateChannel(isResolved, stream)) {
+          return;
+        }
+
         if (err) {
-          if (!isResolved) {
-            isResolved = true;
-            clearTimeout(timeoutId);
-            reject(new McpError(ErrorCode.InternalError, `SSH exec error (${target}): ${err.message}`));
-          }
+          isResolved = true;
+          clearTimeout(timeoutId);
+          reject(new McpError(ErrorCode.InternalError, `SSH exec error (${target}): ${err.message}`));
           conn.end();
           return;
         }
@@ -433,6 +515,13 @@ export async function execSshCommand(
 
         let stdout = '';
         let stderr = '';
+        stream.on('error', (streamErr: Error) => {
+          if (isResolved) return;
+          isResolved = true;
+          clearTimeout(timeoutId);
+          reject(new McpError(ErrorCode.InternalError, `SSH channel error (${target}): ${streamErr.message}`));
+          try { conn.end(); } catch { /* already closed */ }
+        });
         stream.on('close', (code: number | null, signal?: string) => {
           if (isResolved) return;
           isResolved = true;
@@ -466,7 +555,7 @@ export async function execSshCommand(
       reject(new McpError(ErrorCode.InternalError, `SSH connection error: ${err.message}`));
     });
 
-    const { profileId, ...connectConfig } = sshConfig;
+    const { profileId: _profileId, ...connectConfig } = sshConfig;
     conn.connect(connectConfig);
   });
 }
@@ -575,6 +664,20 @@ async function testSshHandshakeAndAuth(
       finish();
     });
 
+    const failClosed = (message: string) => {
+      if (settled) return;
+      clearTimeout(timeoutId);
+      if (!errorMessage) errorMessage = message;
+      retryable = false;
+      finish();
+    };
+    client.once('close', () => {
+      failClosed('SSH connection closed before handshake completed');
+    });
+    client.once('end', () => {
+      failClosed('SSH connection closed before handshake completed');
+    });
+
     client.on('error', (err: Error) => {
       clearTimeout(timeoutId);
       errorMessage = err.message;
@@ -589,7 +692,7 @@ async function testSshHandshakeAndAuth(
       finish();
     });
 
-    const { profileId, ...connectConfig } = sshConfig;
+    const { profileId: _profileId, ...connectConfig } = sshConfig;
     client.connect(connectConfig);
   });
 }
