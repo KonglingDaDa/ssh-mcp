@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   pull_request:
-    branches: [ main ]
+    branches: [main]
 
 jobs:
   test:
@@ -30,6 +30,12 @@ jobs:
         with:
           node-version: 20
       - run: npm ci
+      - name: Build
+        run: npm run build
+      - name: Unit tests
+        env:
+          SSH_MCP_DISABLE_MAIN: "1"
+        run: npm test
       - name: Wait for sshd
         run: |
           for i in {1..60}; do
@@ -37,13 +43,11 @@ jobs:
             sleep 1
           done
           echo "sshd not ready" && exit 1
-      - name: Run tests
+      - name: Docker integration tests
         env:
           SSH_MCP_DISABLE_MAIN: "1"
           SSH_HOST: 127.0.0.1
           SSH_PORT: "2222"
           SSH_USER: test
           SSH_PASSWORD: secret
-        run: npm test
-
-
+        run: npm run test:docker

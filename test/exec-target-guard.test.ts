@@ -1,207 +1,188 @@
-import { afterEach, describe, expect, it } from 'vitest';
-import { mkdtemp, rm, writeFile } from 'fs/promises';
-import os from 'os';
-import path from 'path';
-import { spawn } from 'child_process';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { ErrorCode, McpError } from '@modelcontextprotocol/sdk/types.js';
+import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import {
+  execSshCommandWithConnection,
+  type SSHConnectionManager,
+} from '../src/ssh/connection-manager.js';
+import type { RuntimeOptions } from '../src/cli/args.js';
+import type { ProfileDefinition } from '../src/config/types.js';
+import { registerExecTool } from '../src/tools/exec.js';
+import { assertTargetProfile } from '../src/tools/result.js';
+import { registerSudoExecTool } from '../src/tools/sudo-exec.js';
 
-const tempDirs: string[] = [];
-
-async function makeTempDir(): Promise<string> {
-  const dir = await mkdtemp(path.join(os.tmpdir(), 'ssh-mcp-target-guard-'));
-  tempDirs.push(dir);
-  return dir;
-}
-
-afterEach(async () => {
-  await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
+vi.mock('../src/ssh/connection-manager.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/ssh/connection-manager.js')>();
+  return {
+    ...actual,
+    execSshCommandWithConnection: vi.fn(),
+  };
 });
 
-function extractResponseText(response: any): string {
-  if (response.error?.message) return String(response.error.message);
-  return String(response.result?.content?.[0]?.text ?? '');
-}
+const executeCommand = vi.mocked(execSshCommandWithConnection);
 
-async function startServer(configPath: string, extraArgs: string[] = []): Promise<{
-  callTool: (name: string, args?: Record<string, unknown>) => Promise<any>;
-  close: () => void;
-}> {
-  const serverPath = path.join(process.cwd(), 'build', 'index.js');
-  const child = spawn('node', [serverPath, `--config=${configPath}`, '--timeout=5000', ...extraArgs], {
-    stdio: ['pipe', 'pipe', 'pipe'],
-    env: { ...process.env, SSH_MCP_TEST: '1' },
-  });
+const activeProfile: ProfileDefinition = {
+  id: 'no-pass',
+  name: 'Local No Sudo Password',
+  host: '127.0.0.1',
+  port: 2222,
+  user: 'test',
+  auth: { type: 'password', password: 'secret' },
+  aliases: [],
+  note: '',
+  tags: [],
+};
 
-  let idCounter = 1;
-  let buffer = '';
-  const pending = new Map<number, { resolve: (data: unknown) => void; reject: (err: Error) => void }>();
+const runtime: RuntimeOptions = {
+  timeoutMs: 5000,
+  maxChars: 10_000,
+  disableSudo: false,
+};
 
-  child.stdout.on('data', (chunk) => {
-    buffer += chunk.toString();
-    const lines = buffer.split('\n');
-    buffer = lines.pop() ?? '';
-    for (const line of lines) {
-      if (!line.trim()) continue;
-      try {
-        const message = JSON.parse(line);
-        const pendingRequest = pending.get(message.id);
-        if (pendingRequest) {
-          pending.delete(message.id);
-          pendingRequest.resolve(message);
-        }
-      } catch {
-        // ignore non-json output
-      }
-    }
-  });
+type ToolHandler = (args: Record<string, unknown>) => Promise<{
+  content: Array<{ type: 'text'; text: string }>;
+}>;
 
-  const call = (method: string, params: Record<string, unknown>) => {
-    const id = idCounter++;
-    return new Promise<any>((resolve, reject) => {
-      pending.set(id, { resolve, reject });
-      child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`);
-      setTimeout(() => {
-        if (!pending.has(id)) return;
-        pending.delete(id);
-        reject(new Error(`RPC timeout for ${method}`));
-      }, 15000);
-    });
-  };
-
-  await call('initialize', {
-    capabilities: {},
-    clientInfo: { name: 'test', version: '1.0.0' },
-    protocolVersion: '0.1.0',
-  });
-
-  return {
-    callTool: async (name, args = {}) =>
-      call('tools/call', {
-        name,
-        arguments: args,
-      }),
-    close: () => {
-      if (!child.killed) {
-        child.kill();
-      }
+function makeFakeServer(): {
+  server: McpServer;
+  handlers: Map<string, ToolHandler>;
+} {
+  const handlers = new Map<string, ToolHandler>();
+  const server = {
+    tool(
+      name: string,
+      _description: string,
+      _schema: unknown,
+      handler: ToolHandler,
+    ) {
+      handlers.set(name, handler);
     },
-  };
+  } as unknown as McpServer;
+  return { server, handlers };
 }
+
+function makeManager(): SSHConnectionManager {
+  return {
+    ensureConnected: vi.fn(async () => undefined),
+    getSudoPassword: vi.fn(() => undefined),
+    getProfileId: vi.fn(() => activeProfile.id),
+  } as unknown as SSHConnectionManager;
+}
+
+function registerTools(manager: SSHConnectionManager): Map<string, ToolHandler> {
+  const { server, handlers } = makeFakeServer();
+  const getConnectionContext = async (expectedProfileId?: string) => {
+    assertTargetProfile(activeProfile, expectedProfileId);
+    return { manager, profile: activeProfile };
+  };
+  registerExecTool(server, {
+    getConnectionContext,
+    getRuntimeOptions: () => runtime,
+  });
+  registerSudoExecTool(server, {
+    getConnectionContext,
+    getRuntimeOptions: () => runtime,
+  });
+  return handlers;
+}
+
+async function expectMcpError(promise: Promise<unknown>): Promise<McpError> {
+  try {
+    await promise;
+    throw new Error('expected McpError');
+  } catch (err: unknown) {
+    expect(err).toBeInstanceOf(McpError);
+    return err as McpError;
+  }
+}
+
+afterEach(() => {
+  vi.clearAllMocks();
+});
 
 describe('exec target guard', () => {
-  it('rejects exec and sudo-exec when profileId does not match the session target', async () => {
-    const dir = await makeTempDir();
-    const configPath = path.join(dir, 'profiles.yaml');
-    await writeFile(configPath, `
-version: 1
-activeProfile: alpha
-profiles:
-  - id: alpha
-    name: Alpha
-    host: 127.0.0.1
-    port: 1
-    user: test
-    auth:
-      type: password
-      password: "secret"
-  - id: beta
-    name: Beta
-    host: 127.0.0.1
-    port: 2
-    user: test
-    auth:
-      type: password
-      password: "secret"
-`, 'utf8');
+  it('rejects exec and sudo-exec when profileId does not match and does not call executeCommand', async () => {
+    const manager = makeManager();
+    const handlers = registerTools(manager);
 
-    const server = await startServer(configPath);
-    try {
-      const execRes = await server.callTool('exec', { command: 'true', profileId: 'beta' });
-      const execText = extractResponseText(execRes);
-      expect(execText).toContain('Target profile mismatch: expected "beta", but sessionActiveProfile is "alpha" (127.0.0.1:1). Call profiles-use first or verify target.');
+    const execErr = await expectMcpError(
+      handlers.get('exec')!({ command: 'true', profileId: 'beta' }),
+    );
+    expect(execErr.code).toBe(ErrorCode.InvalidParams);
+    expect(execErr.message).toContain(
+      'Target profile mismatch: expected "beta", but sessionActiveProfile is "no-pass" (127.0.0.1:2222). Call profiles-use first or verify target.',
+    );
 
-      const sudoRes = await server.callTool('sudo-exec', { command: 'true', profileId: 'beta' });
-      const sudoText = extractResponseText(sudoRes);
-      expect(sudoText).toContain('Target profile mismatch: expected "beta", but sessionActiveProfile is "alpha" (127.0.0.1:1). Call profiles-use first or verify target.');
-    } finally {
-      server.close();
-    }
-  }, 45000);
+    const sudoErr = await expectMcpError(
+      handlers.get('sudo-exec')!({ command: 'true', profileId: 'beta' }),
+    );
+    expect(sudoErr.code).toBe(ErrorCode.InvalidParams);
+    expect(sudoErr.message).toContain(
+      'Target profile mismatch: expected "beta", but sessionActiveProfile is "no-pass" (127.0.0.1:2222). Call profiles-use first or verify target.',
+    );
 
-  it('allows exec when profileId matches and stamps non-zero command errors', async () => {
-    const dir = await makeTempDir();
-    const configPath = path.join(dir, 'profiles.yaml');
-    await writeFile(configPath, `
-version: 1
-activeProfile: no-pass
-profiles:
-  - id: no-pass
-    name: Local No Sudo Password
-    host: 127.0.0.1
-    port: 2222
-    user: test
-    auth:
-      type: password
-      password: "secret"
-  - id: other
-    name: Other
-    host: 127.0.0.1
-    port: 2222
-    user: test
-    auth:
-      type: password
-      password: "secret"
-`, 'utf8');
+    expect(executeCommand).not.toHaveBeenCalled();
+    expect(manager.ensureConnected).not.toHaveBeenCalled();
+  });
 
-    const server = await startServer(configPath);
-    try {
-      const ok = await server.callTool('exec', { command: 'echo matched-guard', profileId: 'no-pass' });
-      const okText = extractResponseText(ok);
-      expect(okText).toContain('[ssh-mcp] target id=no-pass name="Local No Sudo Password" host=127.0.0.1:2222');
-      expect(okText).toContain('matched-guard');
+  it('allows a matching profileId, calls the SSH layer, and stamps non-zero command errors', async () => {
+    const manager = makeManager();
+    const handlers = registerTools(manager);
 
-      const failed = await server.callTool('exec', { command: 'sh -c "echo boom-err 1>&2; exit 7"', profileId: 'no-pass' });
-      const failedText = extractResponseText(failed);
-      expect(failedText).toContain('[ssh-mcp] target id=no-pass name="Local No Sudo Password" host=127.0.0.1:2222');
-      expect(failedText).toContain('boom-err');
-    } finally {
-      server.close();
-    }
-  }, 45000);
+    executeCommand.mockResolvedValueOnce({
+      content: [{ type: 'text', text: 'matched-guard\n' }],
+    });
 
-  it('truncates oversized exec output using maxOutputChars', async () => {
-    const dir = await makeTempDir();
-    const configPath = path.join(dir, 'profiles.yaml');
-    await writeFile(configPath, `
-version: 1
-activeProfile: no-pass
-profiles:
-  - id: no-pass
-    name: Local No Sudo Password
-    host: 127.0.0.1
-    port: 2222
-    user: test
-    auth:
-      type: password
-      password: "secret"
-`, 'utf8');
+    const ok = await handlers.get('exec')!({
+      command: 'echo matched-guard',
+      profileId: 'no-pass',
+    });
+    const okText = ok.content[0]?.text ?? '';
+    expect(okText).toContain(
+      '[ssh-mcp] target id=no-pass name="Local No Sudo Password" host=127.0.0.1:2222',
+    );
+    expect(okText).toContain('matched-guard');
+    expect(executeCommand).toHaveBeenCalledOnce();
+    expect(manager.ensureConnected).toHaveBeenCalledOnce();
 
-    const server = await startServer(configPath);
-    try {
-      const res = await server.callTool('exec', {
-        command: "awk 'BEGIN{printf \"AB\"; for(i=0;i<196;i++) printf \"q\"; printf \"YZ\"}'",
+    executeCommand.mockRejectedValueOnce(
+      new McpError(ErrorCode.InternalError, 'Error (code 7):\nboom-err'),
+    );
+
+    const failed = await expectMcpError(
+      handlers.get('exec')!({
+        command: 'sh -c "echo boom-err 1>&2; exit 7"',
         profileId: 'no-pass',
-        maxOutputChars: 100,
-      });
-      const text = extractResponseText(res);
-      const stamp = '[ssh-mcp] target id=no-pass name="Local No Sudo Password" host=127.0.0.1:2222\n';
-      expect(text.startsWith(stamp)).toBe(true);
-      const body = text.slice(stamp.length);
-      expect(body).toHaveLength(100);
-      expect(body.startsWith('AB')).toBe(true);
-      expect(body.trimEnd().endsWith('YZ')).toBe(true);
-      expect(body).toContain('...[ssh-mcp] output truncated (200 chars total, limit 100)...');
-    } finally {
-      server.close();
-    }
-  }, 45000);
+      }),
+    );
+    const stamp = '[ssh-mcp] target id=no-pass name="Local No Sudo Password" host=127.0.0.1:2222';
+    expect(failed.message).toContain(stamp);
+    expect(failed.message).toContain('boom-err');
+    expect(failed.message.indexOf(stamp)).toBeLessThan(failed.message.indexOf('boom-err'));
+    expect(executeCommand).toHaveBeenCalledTimes(2);
+  });
+
+  it('truncates oversized exec output using maxOutputChars and keeps head and tail', async () => {
+    const manager = makeManager();
+    const handlers = registerTools(manager);
+    const remote = `AB${'q'.repeat(196)}YZ`;
+    executeCommand.mockResolvedValueOnce({
+      content: [{ type: 'text', text: remote }],
+    });
+
+    const res = await handlers.get('exec')!({
+      command: 'printf oversized',
+      profileId: 'no-pass',
+      maxOutputChars: 100,
+    });
+    const text = res.content[0]?.text ?? '';
+    const stamp = '[ssh-mcp] target id=no-pass name="Local No Sudo Password" host=127.0.0.1:2222\n';
+    expect(text.startsWith(stamp)).toBe(true);
+    const body = text.slice(stamp.length);
+    expect(body).toHaveLength(100);
+    expect(body.startsWith('AB')).toBe(true);
+    expect(body.trimEnd().endsWith('YZ')).toBe(true);
+    expect(body).toContain('...[ssh-mcp] output truncated (200 chars total, limit 100)...');
+    expect(executeCommand).toHaveBeenCalledOnce();
+  });
 });

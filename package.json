@@ -14,11 +14,11 @@
     "prepare": "npm run build",
     "build": "tsc && shx chmod +x build/*.js",
     "inspect": "npx @modelcontextprotocol/inspector node build/index.js",
-    "test": "cross-env SSH_MCP_DISABLE_MAIN=1 vitest --run --exclude test/smoke.ssh.test.ts",
+    "test": "cross-env SSH_MCP_DISABLE_MAIN=1 vitest --run --exclude test/smoke.ssh.test.ts --exclude test/description.test.ts --exclude test/sudo-exec.test.ts --exclude test/profiles-test.tool.test.ts --exclude test/profile-switch.integration.test.ts --exclude test/persistent-connection.test.ts",
+    "test:docker": "cross-env SSH_MCP_DISABLE_MAIN=1 vitest --run test/description.test.ts test/sudo-exec.test.ts test/profiles-test.tool.test.ts test/profile-switch.integration.test.ts test/persistent-connection.test.ts",
     "test:smoke": "cross-env SSH_MCP_DISABLE_MAIN=1 vitest --run test/smoke.ssh.test.ts",
     "test:watch": "cross-env SSH_MCP_DISABLE_MAIN=1 vitest",
-    "coverage": "cross-env SSH_MCP_DISABLE_MAIN=1 vitest --run --coverage",
-    "publish:release": "pwsh -File scripts/publish.ps1"
+    "coverage": "cross-env SSH_MCP_DISABLE_MAIN=1 vitest --run --coverage"
   },
   "files": [
     "build"
