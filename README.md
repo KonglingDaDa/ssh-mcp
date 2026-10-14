@@ -141,15 +141,29 @@ profiles:
 ## 开发与测试
 
 ```bash
-# 快速运行全部单元与集成测试（不含 Docker 容器冒烟）
+# 离线快速单测（不依赖 Docker / 127.0.0.1:2222）
 npm test
 
-# 运行基于 Testcontainers 的真实 SSH 容器端到端冒烟测试
+# 本地 SSH 容器集成测试（先 docker compose up -d）
+npm run test:docker
+
+# Testcontainers 冒烟测试
 npm run test:smoke
 
 # 编译 TypeScript
 npm run build
 ```
+
+### 项目目录结构
+
+- `src/config/`：profile 配置加载与校验
+- `src/profile/`：会话目标、持久化与分桶目录（`profile-manager.ts`、`profile-catalog.ts`）
+- `src/ssh/`：SSH 连接、保活、断流监听、迟到通道回收
+- `src/tools/`：MCP 工具（`exec` / `sudo-exec` / `profiles-*`，目标门禁与输出截断在 `result.ts`）
+- `docs/INTENT.md`：架构意图与契约
+- `skills/ssh-mcp-operator/`：Agent 操作技能
+- `examples/ssh-mcp.profiles.yaml`：示例配置（`*.example.com` 与环境变量占位）
+- `test/`：Vitest 单测、集成测试与夹具
 
 ## License
 

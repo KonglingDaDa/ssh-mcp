@@ -1,3 +1,6 @@
+# Example ssh-mcp profile catalog.
+# Copy this file, then replace hosts and ${ENV_VAR} placeholders.
+# Do not commit real IPs, hostnames, passwords, or private keys.
 version: 1
 activeProfile: fi-template
 
@@ -6,6 +9,8 @@ defaults:
   maxChars: none
   disableSudo: false
 
+# Directory buckets for profiles-list / profiles-find.
+# Removing a bucket does not delete machines.
 buckets:
   - id: template
     name: 模板机
@@ -24,7 +29,10 @@ profiles:
     auth:
       type: password
       password: "${SSH_TEMPLATE_PASSWORD}"
+    # Optional: sudo-exec uses this with sudo -S. Omit to fall back to sudo -n.
     sudoPassword: "${SSH_TEMPLATE_SUDO_PASSWORD}"
+    # Optional: if set, every exec is already elevated via su -c.
+    # suPassword: "${SSH_TEMPLATE_SU_PASSWORD}"
     note: "模板维护机，做 cloud-init 和预装验证"
     tags: [template, fi]
 
